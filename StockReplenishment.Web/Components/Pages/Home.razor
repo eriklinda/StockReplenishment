@@ -1,0 +1,196 @@
+@page "/"
+@inject RequestsApiClient Api
+@inject NavigationManager Navigation
+
+<PageTitle>Stock requests</PageTitle>
+
+<MudText Typo="Typo.h4" HtmlTag="h1" Class="mb-4">Replenishment requests</MudText>
+
+@if (error is not null)
+{
+    <MudAlert Severity="Severity.Error" Class="mb-4">@error</MudAlert>
+}
+
+<MudPaper Class="pa-4 mb-6" Outlined="true">
+    <MudStack Row Wrap="Wrap.Wrap" AlignItems="AlignItems.Center" Spacing="3">
+        <MudSelect T="RequestStatus?" Label="Status" @bind-Value="statusFilter" Clearable="true">
+            @foreach (var value in Enum.GetValues<RequestStatus>())
+            {
+                <MudSelectItem T="RequestStatus?" Value="value">@value</MudSelectItem>
+            }
+        </MudSelect>
+
+        <MudSelect T="Priority?" Label="Priority" @bind-Value="priorityFilter" Clearable="true">
+            @foreach (var value in Enum.GetValues<Priority>())
+            {
+                <MudSelectItem T="Priority?" Value="value">@value</MudSelectItem>
+            }
+        </MudSelect>
+
+        <MudSelect T="int?" Label="Location" @bind-Value="locationFilter" Clearable="true">
+            @foreach (var location in locations)
+            {
+                <MudSelectItem T="int?" Value="location.Id">@location.Name</MudSelectItem>
+            }
+        </MudSelect>
+
+        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="ApplyFilters" Disabled="busy">Apply filters</MudButton>
+        <MudButton OnClick="Refresh" Disabled="busy">Refresh</MudButton>
+    </MudStack>
+</MudPaper>
+
+@if (result is not null)
+{
+    <MudTable Items="result.Items" Hover="true" Dense="true" Loading="busy">
+        <HeaderContent>
+            <MudTh>Request</MudTh>
+            <MudTh>Location</MudTh>
+            <MudTh>Priority</MudTh>
+            <MudTh>Status</MudTh>
+            <MudTh>Stock check</MudTh>
+            <MudTh>Created (UTC)</MudTh>
+        </HeaderContent>
+        <RowTemplate>
+            <MudTd DataLabel="Request"><MudLink Href="@($"/requests/{context.Id}")">#@context.Id</MudLink></MudTd>
+            <MudTd DataLabel="Location">@context.Location</MudTd>
+            <MudTd DataLabel="Priority">@context.Priority</MudTd>
+            <MudTd DataLabel="Status">@context.Status</MudTd>
+            <MudTd DataLabel="Stock check">@context.ValidationStatus</MudTd>
+            <MudTd DataLabel="Created (UTC)">@context.CreatedAt.UtcDateTime.ToString("yyyy-MM-dd HH:mm")</MudTd>
+        </RowTemplate>
+        <NoRecordsContent>
+            <MudText>No matching requests.</MudText>
+        </NoRecordsContent>
+    </MudTable>
+
+    <MudStack Row Class="my-4" AlignItems="AlignItems.Center">
+        <MudButton OnClick="PreviousPage" Disabled="@(busy || currentPage <= 1)">Previous</MudButton>
+        <MudText>Page @currentPage of @TotalPages · @result.TotalCount requests</MudText>
+        <MudButton OnClick="NextPage" Disabled="@(busy || currentPage >= TotalPages)">Next</MudButton>
+    </MudStack>
+}
+
+<MudPaper Class="pa-6 mt-6" Outlined="true">
+    <MudText Typo="Typo.h5" HtmlTag="h2">Create a draft</MudText>
+
+    <MudSelect T="int" Label="Stock location" @bind-Value="newLocationId" Required="true">
+        @foreach (var location in locations)
+        {
+            <MudSelectItem Value="location.Id">@location.Name</MudSelectItem>
+        }
+    </MudSelect>
+
+    <MudSelect T="Priority" Label="Priority" @bind-Value="newPriority">
+        @foreach (var value in Enum.GetValues<Priority>())
+        {
+            <MudSelectItem Value="value">@value</MudSelectItem>
+        }
+    </MudSelect>
+
+    @foreach (var line in lines)
+    {
+        <MudStack @key="line" Row Wrap="Wrap.Wrap" Class="my-3" AlignItems="AlignItems.Center">
+            <MudTextField Label="Article number" @bind-Value="line.ArticleNumber" MaxLength="RequestLimits.MaxArticleNumberLength" />
+            <MudTextField Label="Description" @bind-Value="line.Description" MaxLength="RequestLimits.MaxDescriptionLength" />
+            <MudNumericField T="decimal" Label="Requested quantity" @bind-Value="line.Quantity"
+                             Min="RequestLimits.MinRequestedQuantity" Max="RequestLimits.MaxRequestedQuantity" />
+            <MudButton OnClick="@(() => lines.Remove(line))" Disabled="@(busy || lines.Count == 1)">Remove</MudButton>
+        </MudStack>
+    }
+
+    <MudStack Row Class="mt-4">
+        <MudButton OnClick="@(() => lines.Add(new DraftLine()))" Disabled="@(busy || lines.Count >= RequestLimits.MaxItems)">Add material</MudButton>
+        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="CreateDraft" Disabled="busy">Create draft</MudButton>
+    </MudStack>
+
+    <MudText Typo="Typo.caption" Class="mt-3">Demo stock: 100 units per article. Articles beginning LOW- have 2 units.</MudText>
+</MudPaper>
+
+@code {
+    private const int PageSize = 10;
+
+    private List<LocationResponse> locations = [];
+    private RequestPage? result;
+    private int currentPage = 1;
+    private RequestStatus? statusFilter;
+    private Priority? priorityFilter;
+    private int? locationFilter;
+
+    private int newLocationId;
+    private Priority newPriority = Priority.Normal;
+    private readonly List<DraftLine> lines = [new()];
+
+    private bool busy;
+    private string? error;
+
+    private int TotalPages => result is null ? 1 : Math.Max(1, (int)Math.Ceiling(result.TotalCount / (double)PageSize));
+
+    protected override Task OnInitializedAsync() => Run(async () =>
+    {
+        locations = await Api.Get<List<LocationResponse>>("api/locations");
+        newLocationId = locations.FirstOrDefault()?.Id ?? 0;
+        await LoadRequests();
+    });
+
+    private async Task LoadRequests()
+    {
+        var query = $"api/requests?page={currentPage}&pageSize={PageSize}";
+        if (statusFilter is not null) query += $"&status={statusFilter}";
+        if (priorityFilter is not null) query += $"&priority={priorityFilter}";
+        if (locationFilter is not null) query += $"&locationId={locationFilter}";
+
+        result = await Api.Get<RequestPage>(query);
+    }
+
+    private Task Refresh() => Run(LoadRequests);
+
+    private Task ApplyFilters()
+    {
+        currentPage = 1;
+        return Refresh();
+    }
+
+    private Task PreviousPage()
+    {
+        currentPage--;
+        return Refresh();
+    }
+
+    private Task NextPage()
+    {
+        currentPage++;
+        return Refresh();
+    }
+
+    private Task CreateDraft() => Run(async () =>
+    {
+        var items = lines.Select(line => new CreateItem(line.ArticleNumber, line.Description, line.Quantity)).ToList();
+        var created = await Api.Post<RequestResponse>("api/requests", new CreateRequest(newLocationId, newPriority, items));
+        Navigation.NavigateTo($"/requests/{created.Id}");
+    });
+
+    private async Task Run(Func<Task> action)
+    {
+        busy = true;
+        error = null;
+        try
+        {
+            await action();
+        }
+        catch (HttpRequestException ex)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            busy = false;
+        }
+    }
+
+    private sealed class DraftLine
+    {
+        public string ArticleNumber { get; set; } = "";
+        public string Description { get; set; } = "";
+        public decimal Quantity { get; set; } = 1;
+    }
+}

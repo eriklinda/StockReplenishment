@@ -1,0 +1,41 @@
+@host = http://localhost:5037
+
+GET {{host}}/api/locations
+
+### Browse requests
+GET {{host}}/api/requests?status=Draft&page=1&pageSize=10
+
+### Create a draft
+POST {{host}}/api/requests
+Content-Type: application/json
+
+{
+  "locationId": 1,
+  "priority": "Urgent",
+  "items": [
+    { "articleNumber": "BOLT-M8", "description": "M8 steel bolts", "requestedQuantity": 20 }
+  ]
+}
+
+### Set this to the ID returned by create
+@requestId = 16
+
+POST {{host}}/api/requests/{{requestId}}/submit
+
+### Poll until validationStatus changes from Pending
+GET {{host}}/api/requests/{{requestId}}
+
+### Approve after validationStatus is Available
+POST {{host}}/api/requests/{{requestId}}/approve
+
+### Use the item's ID from the GET response
+POST {{host}}/api/requests/{{requestId}}/fulfill
+Content-Type: application/json
+
+{ "items": [{ "itemId": 31, "quantity": 20 }] }
+
+### Alternative: reject a Submitted request
+POST {{host}}/api/requests/{{requestId}}/reject
+Content-Type: application/json
+
+{ "reason": "Duplicate request" }

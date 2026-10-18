@@ -1,0 +1,228 @@
+@page "/requests/{Id:int}"
+@implements IAsyncDisposable
+@inject RequestsApiClient Api
+
+<PageTitle>Request #@Id</PageTitle>
+
+<MudLink Href="/">Back to requests</MudLink>
+<MudText Typo="Typo.h4" HtmlTag="h1" Class="my-4">Request #@Id</MudText>
+
+@if (error is not null)
+{
+    <MudAlert Severity="Severity.Error" Class="mb-4">@error</MudAlert>
+}
+
+@if (request is not null)
+{
+    <MudPaper Class="pa-6" Outlined="true">
+        <MudText Typo="Typo.h6">@request.Location · @request.Priority priority</MudText>
+        <MudText Class="my-2">Status: @request.Status · Stock check: @request.ValidationStatus</MudText>
+        <MudText Typo="Typo.caption">Created @request.CreatedAt.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss") UTC</MudText>
+
+        @if (request.ValidationStatus == ValidationStatus.Pending)
+        {
+            <MudProgressLinear Indeterminate Color="Color.Primary" Class="my-4" />
+            <MudAlert Severity="Severity.Info">Checking stock in the background. Results update automatically; you can leave this page.</MudAlert>
+        }
+        else if (request.ValidationMessage is not null)
+        {
+            var severity = request.ValidationStatus == ValidationStatus.Available ? Severity.Success : Severity.Warning;
+            <MudAlert Severity="severity" Class="my-3">@request.ValidationMessage</MudAlert>
+        }
+
+        @if (request.RejectionReason is not null)
+        {
+            <MudAlert Severity="Severity.Warning">Rejection reason: @request.RejectionReason</MudAlert>
+        }
+
+        <MudTable Items="request.Items" Dense="true" Class="my-4">
+            <HeaderContent>
+                <MudTh>Article</MudTh>
+                <MudTh>Description</MudTh>
+                <MudTh>Requested</MudTh>
+                <MudTh>Available</MudTh>
+                <MudTh>Fulfilled</MudTh>
+            </HeaderContent>
+            <RowTemplate>
+                <MudTd DataLabel="Article">@context.ArticleNumber</MudTd>
+                <MudTd DataLabel="Description">@context.Description</MudTd>
+                <MudTd DataLabel="Requested">@context.RequestedQuantity</MudTd>
+                <MudTd DataLabel="Available">@(context.AvailableQuantity?.ToString() ?? "—")</MudTd>
+                <MudTd DataLabel="Fulfilled">
+                    @if (request.Status == RequestStatus.Approved)
+                    {
+                        <MudNumericField T="decimal" Label="@($"Fulfilled {context.ArticleNumber}")"
+                                         @bind-Value="fulfilledQuantities[context.Id]"
+                                         Min="0m" Max="context.RequestedQuantity" Disabled="busy" />
+                    }
+                    else
+                    {
+                        @(context.FulfilledQuantity?.ToString() ?? "—")
+                    }
+                </MudTd>
+            </RowTemplate>
+        </MudTable>
+
+        <MudStack Row Wrap="Wrap.Wrap" Class="my-4">
+            <MudButton OnClick="Refresh" Disabled="busy">Refresh</MudButton>
+
+            @if (request.Status == RequestStatus.Draft)
+            {
+                <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="Submit" Disabled="busy">Submit for approval</MudButton>
+            }
+
+            @if (request.Status == RequestStatus.Submitted)
+            {
+                <MudButton Variant="Variant.Filled" Color="Color.Success" OnClick="Approve"
+                           Disabled="@(busy || request.ValidationStatus != ValidationStatus.Available)">Approve</MudButton>
+
+                @if (request.ValidationStatus == ValidationStatus.Failed)
+                {
+                    <MudButton OnClick="RetryValidation" Disabled="busy">Retry stock check</MudButton>
+                }
+            }
+
+            @if (request.Status == RequestStatus.Approved)
+            {
+                <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="Fulfill" Disabled="busy">Mark fulfilled</MudButton>
+            }
+        </MudStack>
+
+        @if (request.Status == RequestStatus.Submitted)
+        {
+            <MudTextField Label="Rejection reason" @bind-Value="rejectionReason" Lines="2" MaxLength="RequestLimits.MaxRejectionReasonLength" Disabled="busy" />
+            <MudButton Color="Color.Error" OnClick="Reject" Disabled="@(busy || string.IsNullOrWhiteSpace(rejectionReason))">Reject request</MudButton>
+        }
+
+        @if (request.Status == RequestStatus.Approved)
+        {
+            <MudText Typo="Typo.caption">Enter the actual quantities delivered. Marking fulfilled closes the request, including any unfulfilled remainder.</MudText>
+        }
+    </MudPaper>
+}
+
+@code {
+    [Parameter] public int Id { get; set; }
+
+    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
+
+    private RequestResponse? request;
+    private readonly Dictionary<int, decimal> fulfilledQuantities = [];
+    private string rejectionReason = "";
+    private string? error;
+    private bool busy;
+
+    private readonly CancellationTokenSource lifetime = new();
+    private Task? polling;
+
+    private string RequestPath => $"api/requests/{Id}";
+
+    protected override async Task OnParametersSetAsync()
+    {
+        request = null;
+        fulfilledQuantities.Clear();
+        await Refresh();
+    }
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (firstRender)
+            polling = PollWhileValidationIsPending();
+    }
+
+    private Task Refresh() => Run(async () => Show(await Api.Get<RequestResponse>(RequestPath, lifetime.Token)));
+
+    private Task Submit() => Post("submit");
+
+    private Task RetryValidation() => Post("retry-validation");
+
+    private Task Approve() => Post("approve");
+
+    private Task Reject() => Post("reject", new RejectRequest(rejectionReason));
+
+    private Task Fulfill()
+    {
+        var items = fulfilledQuantities.Select(entry => new FulfillItem(entry.Key, entry.Value)).ToList();
+        return Post("fulfill", new FulfillRequest(items));
+    }
+
+    private Task Post(string action, object? body = null) => Run(async () =>
+    {
+        try
+        {
+            Show(await Api.Post<RequestResponse>($"{RequestPath}/{action}", body));
+        }
+        catch (HttpRequestException)
+        {
+            // The request may have changed elsewhere (for example a 409), so show its current state.
+            await TryReload();
+            throw;
+        }
+    });
+
+    private async Task TryReload()
+    {
+        try
+        {
+            Show(await Api.Get<RequestResponse>(RequestPath, lifetime.Token));
+        }
+        catch (HttpRequestException)
+        {
+        }
+    }
+
+    private void Show(RequestResponse value)
+    {
+        request = value;
+        foreach (var item in value.Items)
+            fulfilledQuantities.TryAdd(item.Id, item.RequestedQuantity);
+    }
+
+    private async Task Run(Func<Task> action)
+    {
+        busy = true;
+        error = null;
+        try
+        {
+            await action();
+        }
+        catch (HttpRequestException ex)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            busy = false;
+        }
+    }
+
+    private async Task PollWhileValidationIsPending()
+    {
+        using var timer = new PeriodicTimer(PollInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(lifetime.Token))
+            {
+                await InvokeAsync(async () =>
+                {
+                    if (busy || request?.ValidationStatus != ValidationStatus.Pending)
+                        return;
+
+                    await Refresh();
+                    StateHasChanged();
+                });
+            }
+        }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+        {
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await lifetime.CancelAsync();
+        if (polling is not null)
+            await polling;
+        lifetime.Dispose();
+    }
+}
